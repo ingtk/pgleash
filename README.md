@@ -3,8 +3,8 @@
 ユーザーが承認したローカル開発用PostgreSQLだけを操作する、小さなGo製CLIです。
 接続先とCLI自身のOS操作経路を制限し、ローカルDBで許すSQL操作は制限しません。
 
-現在は、設定の検査・プロファイル一覧の表表示・ヘルプに対応しています（[#2](https://github.com/ingtk/pgleash/issues/2)）。
-SQL実行は[#3](https://github.com/ingtk/pgleash/issues/3)、JSON/CSVは[#4](https://github.com/ingtk/pgleash/issues/4)・[#5](https://github.com/ingtk/pgleash/issues/5)で追加します。
+SQL実行・複数結果の表表示、設定の検査、プロファイル一覧、ヘルプに対応しています。
+JSON/CSVは[#4](https://github.com/ingtk/pgleash/issues/4)・[#5](https://github.com/ingtk/pgleash/issues/5)で追加します。
 
 ## 実行
 
@@ -14,6 +14,9 @@ Go 1.23以上、macOSまたはLinuxを使用します。
 go run ./cmd/pgleash --help
 go run ./cmd/pgleash --profiles
 go run ./cmd/pgleash --profiles --format table
+go run ./cmd/pgleash --profile dev "SELECT * FROM items"
+go run ./cmd/pgleash "UPDATE items SET active = false; SELECT * FROM items" --limit 20
+go run ./cmd/pgleash "BEGIN; DELETE FROM items WHERE id = 1; COMMIT;"
 ```
 
 ビルドする場合は、次のように実行します。
@@ -26,8 +29,36 @@ go build -o /tmp/pgleash ./cmd/pgleash
 `--help` は設定ファイルなしで使えます。`-h` は受け付けません。
 一覧は名前順に、名前・ポート・ユーザー名・DB名だけを表示し、DBには接続しません。
 パスワードを含む設定内容や接続文字列を診断へ表示せず、一覧の制御文字は見える表現に変換します。
-`--profile NAME` は登録名を検査します。一覧では選択にかかわらず全プロファイルを表示します。
+`--profile NAME` はSQLの接続先を選択します。一覧では登録名だけを検査し、選択にかかわらず全プロファイルを表示します。
 現在選べる出力形式は `table` のみです。エラーは標準エラーへ出力し、終了コード1で終了します。
+
+SQLは位置引数1つで渡し、オプションはSQLの前後に置けます。複数文や関数内のセミコロンをCLIが分割することはありません。
+SQLがオプションのように見える場合は、`--` の後に渡せます。空のSQL・引数の過不足・バックスラッシュで始まるpsql形式は拒否します。
+
+| オプション | 既定値 | 範囲・動作 |
+| --- | --- | --- |
+| `--timeout` | 30秒 | 整数の1〜300秒。サーバーのstatement_timeoutとSQL全体のクライアント期限を併用 |
+| `--limit` | 500行 | 1〜10,000行。全結果を通じた表示行数の合計 |
+| `--max-width` | 200文字 | 0〜10,000文字。0は省略なし。省略記号も文字数に含む |
+
+行数上限を超えても、残りの行を読み捨てて後続のSQLを実行します。SQLにLIMITは追加しません。
+省略通知は標準エラーに出し、各文のCommandTag・影響行数を表示します。NULLは `NULL` と表示し、空文字と区別します。
+保持する結果と描画結果にはそれぞれ16 MiBの上限があり、超過はエラーです。ドライバの一時領域を含めたプロセス全体のメモリ上限ではありません。
+
+### 接続とトランザクション
+
+接続先は設定だけで決まり、SSLは無効、接続・接続直後の検証期限は5秒です。
+接続直後にDB名とユーザー名を照合し、不一致ならユーザーSQLを実行せず終了します。pgpass・サービスファイルの認証情報も使用しません。
+
+pgleashはBEGIN・COMMIT・ROLLBACKを追加しません。通常のPostgreSQLの動作と入力SQLのトランザクション境界に従います。
+複数文は通常1つの暗黙トランザクションですが、明示的なCOMMITなどで境界が変わります。終了時にトランザクションが開いたままならエラーにして切断し、未確定分をROLLBACKさせます。
+
+SQL全体と終了状態を確認してから結果を表示します。失敗時は部分結果を標準出力へ出しません。
+**終了コード1でも、先行COMMITなどでDB変更が残る場合があります。** 通信切断や描画・容量エラーでも、反映済みか不明な場合があります。自動再実行はしません。
+PostgreSQLのエラーはSQLSTATEとメッセージを、秘密情報を伏せて表示します。
+
+`COPY ... FROM STDIN`・`COPY ... TO STDOUT` など、クライアントとのCOPY転送は未対応として速やかに接続を閉じます。
+サーバー側のファイルやPROGRAMを対象とするCOPYは別で、DB権限に従います。
 
 ## 設定
 
@@ -82,7 +113,19 @@ OSによるユーザー情報の取得など、OS・ライブラリ内部の参�
 ```sh
 go test ./...
 go vet ./...
+go test -tags integration ./internal/cli -run TestPostgresIntegration -timeout 180s
 ```
 
 テストはCLIの入口から、引数・出力・終了コードを検証します。設定用の一時ホームはテスト内でだけ差し替えます。
 本番コードへの禁止import・コマンド実行API・環境変数による設定上書きAPIの追加も構造チェックで検出します。
+結合テストはDockerが動く環境で実行します。PostgreSQL 14・18の専用コンテナをループバックの一時ポートに起動し、テスト終了時にコンテナとそのボリュームだけを削除します。
+
+### 依存監査の評価（2026-10-22）
+
+Go 1.23互換のpgx依存を使用しています。`govulncheck` の静的な呼び出し経路の指摘には、次の適用条件の評価が必要です。再評価日は2026-11-22とし、接続・認証経路や依存版を変更する場合はその時点でも確認します。
+
+- [GO-2026-6629](https://pkg.go.dev/vuln/GO-2026-6629)：対象はprecisのNicknameプロファイル。pgxのSCRAM認証で使用するのはOpaqueStringであり、その入力はユーザー管理TOMLのパスワードだけです。SQLやサーバー応答はこの入力になりません。
+- [GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970)：対象は不正UTF-8入力による正規化のループ。認証入力のパスワードはTOMLデコーダーで検証され、不正UTF-8の設定は接続前に拒否します。これをCLI境界のテストで確認しています。上記2件の修正版x/textはGo 1.25を要求するため、最低Go 1.23を維持するこの実装では更新を保留します。
+- [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809)：検証に使用したGo 1.27.2の証明書検証。修正はGo 1.27.3です。このCLIはTLSとそのフォールバックを無効にし、TCP4の固定接続しか作らないため、証明書検証は実行しません。
+
+この評価は監査の指摘がゼロであるという意味ではありません。修正済みのGoでビルドし、将来TLS・外部認証入力・対応Goバージョンを変更する場合は保留理由を見直してください。

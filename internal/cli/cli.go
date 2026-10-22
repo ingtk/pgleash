@@ -14,16 +14,20 @@ import (
 )
 
 const help = `Usage:
+  pgleash [options] "SQL"
   pgleash --profiles
   pgleash --help
 
 Options:
   --profiles  List configured connection profiles (table format).
-  --profile NAME  Validate a configured profile name; listing still includes all profiles.
+  --profile NAME  Select a configured connection profile.
   --format table  Select table output (the only format available yet).
+  --timeout SECONDS  Execution deadline, 1-300 (default 30).
+  --limit ROWS       Total displayed rows, 1-10000 (default 500).
+  --max-width CHARS  Table cell width, 0-10000; 0 disables shortening (default 200).
   --help      Show this help without reading configuration.
 
-SQL execution and JSON/CSV output are not available yet.
+JSON/CSV output is not available yet. SQL may contain multiple statements.
 `
 
 // Run executes the CLI and returns its process exit code.
@@ -67,7 +71,7 @@ func run(args []string, stdout, stderr io.Writer, lookup func() (identity, error
 		fmt.Fprintln(stderr, "pgleash: cannot write output")
 		return 1
 	}
-	if opts.profiles {
+	{
 		who, err := lookup()
 		if err != nil {
 			fmt.Fprintln(stderr, "pgleash: cannot resolve executing user")
@@ -78,11 +82,34 @@ func run(args []string, stdout, stderr io.Writer, lookup func() (identity, error
 			fmt.Fprintln(stderr, "pgleash:", err)
 			return 1
 		}
-		if opts.profile != "" {
-			if _, ok := config.Profiles[opts.profile]; !ok {
-				fmt.Fprintln(stderr, "pgleash: selected profile does not exist")
+		selected := opts.profile
+		if selected == "" {
+			selected = *config.DefaultProfile
+		}
+		if _, ok := config.Profiles[selected]; !ok {
+			fmt.Fprintln(stderr, "pgleash: selected profile does not exist")
+			return 1
+		}
+		if !opts.profiles {
+			p := config.Profiles[selected]
+			batch, err := executeSQL(p, opts)
+			if err != nil {
+				fmt.Fprintln(stderr, "pgleash:", sqlDiagnostic(err, *p.Password))
 				return 1
 			}
+			output, err := renderResults(batch, opts)
+			if err != nil {
+				fmt.Fprintln(stderr, "pgleash:", sqlDiagnostic(&sqlFailure{err, true}, *p.Password))
+				return 1
+			}
+			if _, err := io.WriteString(stdout, output); err != nil {
+				fmt.Fprintln(stderr, "pgleash: cannot write output; database changes may already be committed; do not retry automatically")
+				return 1
+			}
+			if batch.omitted {
+				fmt.Fprintln(stderr, "pgleash: rows omitted by --limit")
+			}
+			return 0
 		}
 		var table strings.Builder
 		w := tabwriter.NewWriter(&table, 0, 4, 2, ' ', 0)
@@ -103,8 +130,6 @@ func run(args []string, stdout, stderr io.Writer, lookup func() (identity, error
 		}
 		return 0
 	}
-	fmt.Fprintln(stderr, "pgleash: expected --profiles or --help")
-	return 1
 }
 
 func displayText(s string) string {
@@ -124,11 +149,25 @@ type options struct {
 	help     bool
 	profiles bool
 	profile  string
+	sql      string
+	timeout  int
+	limit    int
+	maxWidth int
 }
 
 func parseOptions(args []string) (options, error) {
-	var opts options
+	opts := options{timeout: 30, limit: 500, maxWidth: 200}
+	var positional []string
+	endOptions := false
 	for i := 0; i < len(args); i++ {
+		if endOptions || strings.HasPrefix(args[i], "--") && strings.ContainsAny(args[i], "\r\n") {
+			positional = append(positional, args[i])
+			continue
+		}
+		if args[i] == "--" {
+			endOptions = true
+			continue
+		}
 		name, value, hasValue := strings.Cut(args[i], "=")
 		switch name {
 		case "--help", "--profiles":
@@ -140,7 +179,7 @@ func parseOptions(args []string) (options, error) {
 			} else {
 				opts.profiles = true
 			}
-		case "--profile", "--format":
+		case "--profile", "--format", "--timeout", "--limit", "--max-width":
 			if !hasValue {
 				i++
 				if i == len(args) {
@@ -153,15 +192,42 @@ func parseOptions(args []string) (options, error) {
 			}
 			if name == "--profile" {
 				opts.profile = value
-			} else if value != "table" {
+			} else if name == "--format" && value != "table" {
 				return options{}, fmt.Errorf("only table format is available yet")
+			} else if name != "--format" {
+				n, err := strconv.Atoi(value)
+				min, max := 1, 10000
+				if name == "--timeout" {
+					max = 300
+				}
+				if name == "--max-width" {
+					min = 0
+				}
+				if err != nil || n < min || n > max {
+					return options{}, fmt.Errorf("numeric option is outside its supported range")
+				}
+				switch name {
+				case "--timeout":
+					opts.timeout = n
+				case "--limit":
+					opts.limit = n
+				case "--max-width":
+					opts.maxWidth = n
+				}
 			}
 		default:
-			return options{}, fmt.Errorf("unrecognized option or unsupported invocation; use --help")
+			if strings.HasPrefix(args[i], "-") {
+				return options{}, fmt.Errorf("unrecognized option; use --help")
+			}
+			positional = append(positional, args[i])
 		}
 	}
-	if opts.help && len(args) == 1 || opts.profiles && !opts.help {
+	if opts.help && len(args) == 1 || opts.profiles && !opts.help && len(positional) == 0 {
 		return opts, nil
 	}
-	return options{}, fmt.Errorf("expected --profiles or --help")
+	if opts.help || opts.profiles || len(positional) != 1 || strings.TrimSpace(positional[0]) == "" || strings.HasPrefix(strings.TrimSpace(positional[0]), `\`) {
+		return options{}, fmt.Errorf("expected exactly one nonempty SQL argument, --profiles, or --help")
+	}
+	opts.sql = positional[0]
+	return opts, nil
 }

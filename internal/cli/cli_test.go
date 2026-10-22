@@ -125,6 +125,7 @@ func TestProfilesRejectInvalidConfigurationWithoutLeakingValues(t *testing.T) {
 	for name, content := range map[string]string{
 		"empty":                 "",
 		"malformed":             "password = \"secret-never-print\"\n[broken",
+		"invalid-utf8-password": strings.Replace(validConfig, "secret-never-print", string([]byte{0xff}), 1),
 		"unknown-root":          "host = \"secret-never-print\"\n" + validConfig,
 		"unknown-profile":       validConfig + "host = \"secret-never-print\"\n",
 		"unknown-password-typo": strings.Replace(validConfig, "password =", "pasword =", 1),
@@ -189,8 +190,7 @@ func TestInvalidArgumentsNeverDiscloseTheirValues(t *testing.T) {
 	for _, args := range [][]string{
 		nil, {"-h"}, {"--host", "secret-input"}, {"--port", "9999"},
 		{"--dsn=postgres://secret-input"}, {"--config", "secret-input"},
-		{"--profiles", "--password=secret-input"}, {"host=secret-input"},
-		{"postgres://secret-input"}, {"--help", "secret-input"},
+		{"--profiles", "--password=secret-input"}, {"--help", "secret-input"},
 		{"--profiles", "--help"}, {"--profiles=true"}, {"--help=true"},
 		{"--profiles", "--profile"}, {"--profiles", "--profile="},
 		{"--profiles", "--format"}, {"--profiles", "--format=json"},
